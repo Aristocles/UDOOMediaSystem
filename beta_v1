@@ -1,0 +1,172 @@
+
+/* 
+    UDOO Media System - March 2014 - Jay Aristocles (jay@enail.com.au)
+    http://makeitbreakitfixit.com/2014/02/28/diy-complete-media-system-that-fits-in-the-palm-of-your-hand/
+    See above link for full DIY instructions on how to build your own UDOO Media System
+    This code is also available on GitHub under my account https://github.com/JaykGit/
+    
+    You may way to change the configuration below, but leaving at the defaults should work
+    just fine. No other modifications needed.
+    
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+    
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+    
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+    Credit to http://www.hacktronics.com/Tutorials/arduino-thermistor-tutorial for thermistor code.
+*/
+
+// START CONFIGURATION (do not edit anything above this line)
+//
+int delay_lcd_temp = 1; // Time delay between LCD refreshes with the current temp (seconds)
+int max_temp = 45; // Maximum temp before the fan is switched on (celsius)
+int fan_run_length = 320; // Length of time the fan will stay on once triggered (seconds)
+int min_temp = 30; // Temp at which the fan will stop spinning, even if fan_run_length time not reached (celsius)
+//
+// END CONFIGURATION (do not edit anything below this line)
+
+
+#include <LiquidCrystal.h>
+#include <math.h>
+
+#define BACKLIGHT 2 // LCD backlight pin
+#define RELAY 12 // Relay pin
+#define BUTTON 11 // Pushbutton
+#define THERMISTOR A0 // Analog pin for temp sensor
+/*
+  LCD Connections:
+  rs (LCD pin 4) to Arduino pin 9
+  rw (LCD pin 5) to Arduino pin 8
+  enable (LCD pin 6) to Arduino pin 7
+  LCD pin 15 to Arduino pin 2
+  LCD pins d4, d5, d6, d7 to Arduino pins 6, 5, 4, 3
+*/
+LiquidCrystal lcd(9, 8, 7, 6, 5, 4, 3);
+int intButton = 0;
+unsigned long tempTimer;
+unsigned long fanTimer;
+
+void setup() {
+  Serial.begin(115200); // Serial sync speed. This needs to match in UDOO Linux for comms
+  pinMode(RELAY, OUTPUT); // Relay switch for running 12V fan
+  pinMode(BACKLIGHT, OUTPUT); // LCD backlilght pin. This is statically set using resistor
+  digitalWrite(BACKLIGHT, HIGH); // turn LCD backlight on
+  pinMode(BUTTON, INPUT);
+  digitalWrite(BUTTON, HIGH); // Turns internal pull-up resistor on
+  lcd.begin(16, 2);              // LCD 16 rows, 2 columns
+  lcd.clear();                   // start with a blank screen
+  lcd.setCursor(0,0);            // set cursor to column 0, row 0 (top left)
+}
+
+void loop() {
+  if (millis() > 4294960000) // millis() (a 32bit number) wrap detection
+    delay(10000); // This will stop code from running for ~10 seconds to prevent
+                  // timer problems due to millis() wrap during a timer running
+                  // Yes, NOTHING will happen during this 10 seconds, but this should only
+                  // occur once every ~50 days (~4,294,967 seconds).
+                  // You can decrease the delay, but be sure to add to the 'if' statement
+                  // however many milliseconds you remove from the delay.
+                  // (eg. A delay of 5000 would mean you add the difference (5000) to 4294960000)
+  double temp = drawTemp(delay_lcd_temp);
+  checkButton();
+  checkTemp(temp, fan_run_length, max_temp, min_temp);
+}
+
+double Thermister(int RawADC) {
+  double temp = log(((10240000/RawADC) - 10000));
+  // See http://en.wikipedia.org/wiki/Thermistor for explanation of formula
+  temp = 1 / (0.001129148 + (0.000234125 * temp) + (0.0000000876741 * temp * temp * temp));
+  temp = temp - 273.15;           // Convert Kelvin to Celcius
+  return temp;
+}
+
+int drawTemp(int delay) {
+  double temp = Thermister(analogRead(THERMISTOR));  // Read temp sensor
+  if (tempTimer == 0)
+    tempTimer = millis();
+  if (actionTrigger(tempTimer, delay) == false) // Run the code every <delay> seconds
+    return temp; // Exit function if it isnt time to run the code yet
+
+  tempTimer = 0; // Reset the trigger counter
+  lcd.setCursor(10,1);
+  if (temp < 10)
+    lcd.print("0"); // Pad with a zero is less than 10
+  lcd.print(temp);
+  lcd.print("C");
+  Serial.print("[TEMP] - Temperature is ");
+  Serial.print(temp);
+  Serial.print(" C\n");
+  return temp;
+}
+
+void checkTemp(double temp, int fanTime, int maxTemp, int minTemp) {
+  int delay = fanTime;
+  if ((temp < maxTemp) && digitalRead(RELAY) == LOW)
+    return; // Nothing to see here, move along (exit function)
+  if ((digitalRead(RELAY) == HIGH) && (temp < min_temp)) { // Fan already running but below min_temp threshold
+    digitalWrite(RELAY, LOW); // Switch off fan regardless of fan timer state
+    Serial.print("[FAN] - Switched off due to temp dropping below ");
+    Serial.print(minTemp);
+    Serial.print("C\n");
+    fanTimer = 0;
+    Serial.print("[FAN] - Timer reset\n");
+    return; // Exit function
+  }
+  if (fanTimer == 0) {
+    fanTimer = millis();
+    Serial.print("[FAN] - Timer started. Fan will run for ");
+    Serial.print(fanTime);
+    Serial.print(" seconds, unless temp drops below ");
+    Serial.print(minTemp);
+    Serial.print("C first\n");
+    digitalWrite(RELAY, HIGH); // Turn fan on    
+  }
+  if (actionTrigger(fanTimer, delay) == true) {
+    digitalWrite(RELAY, LOW); // Timer expired, turn fan off
+    Serial.print("[FAN] - Switched off due to timer expiring\n");
+    fanTimer = 0;
+    Serial.print("[FAN] - Timer reset\n");
+  } else if (millis() < fanTimer) { // millis() wrap detection
+    digitalWrite(RELAY, LOW); // This is needed as the wrap detection in loop() is
+                              // too short to help us here.
+    Serial.print("[FAN] - Switched off due to millis() wrap error prevention\n");
+    fanTimer = 0;
+    Serial.print("[FAN] - Timer reset\n");
+  }
+}
+
+void checkButton() {
+  int buttonState = digitalRead(BUTTON);
+  if (buttonState == LOW) { // button pressed
+    Serial.print("[BUTTON] - Button press detected\n");
+    digitalWrite(RELAY, !digitalRead(RELAY));
+    delay(500);
+  }
+}
+
+boolean actionTrigger(unsigned long localTime, unsigned int triggerDelay) {
+/*
+  This function is designed to keep track of when to "do things"
+  and notify the calling function when it is time to trigger an
+  event. For example, if the temp sensor should be updated and
+  shown on LCD screen every 4 seconds, this functions will notify
+  when the 4 seconds is up.
+  This function accepts two parameters.
+  localTime - This is the time that we start counting from
+  triggerDelay - This is the length of time we count (in seconds)
+  When it is time to trigger an action, the function will return
+  TRUE, otherwise it will return FALSE.  
+*/
+  if ((millis() >  localTime) && ((millis() - localTime) > (triggerDelay * 1000)))
+    return true; // Check to ensure millis() hasn't wrapped;
+                 // and also if it is time to trigger an action
+  return false; // Otherwise, nothing changes
+}
