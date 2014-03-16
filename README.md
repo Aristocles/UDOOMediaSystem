@@ -9,8 +9,11 @@ UDOO Media System - See http://makeitbreakitfixit.com/2014/02/28/diy-complete-me
 QUICK INSTRUCTIONS:
 
 1) Grab the latest Arduino sketch/code release (current latest release is v1.0.1) and paste it in to your Arduino IDE
+
 2) Make config changes if required and upload the sketch/code to the Arduino
+
 3) Grab the Linux test script (current test script is serial_comms_test.sh) and paste it in to a new file in your Linux machine, make required config changes, make executable and then run the script. Basic steps in Linux shell are:
+
   - cd ~/bin
   - nano serial_comms_test.sh
   - <paste script in here, make config changes> CTRL+X to quit (say 'Y' when asked to save buffer)
