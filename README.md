@@ -8,7 +8,7 @@ UDOO Media System - See http://makeitbreakitfixit.com/2014/02/28/diy-complete-me
 
 QUICK INSTRUCTIONS:
 
-1) Grab the latest Arduino sketch/code release (current latest release is v1.0.1) and paste it in to your Arduino IDE
+1) Grab the latest Arduino sketch/code release (current release is v1.0.1) and paste it in to your Arduino IDE
 
 2) Make config changes if required and upload the sketch/code to the Arduino
 
