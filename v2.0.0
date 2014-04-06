@@ -1,0 +1,884 @@
+/* 
+    UDOO Media System - March 2014 - Jay Aristocles (jay@enail.com.au)
+    http://makeitbreakitfixit.com/2014/02/28/diy-complete-media-system-that-fits-in-the-palm-of-your-hand/
+    See above link for full DIY instructions on how to build your own UDOO Media System
+    This code is also available on GitHub under my account https://github.com/JaykGit/
+    
+    You may want to change the configuration below, but leaving at the defaults should work
+    just fine. No other modifications needed. Default LCD is 2x16.
+    
+    CHANGELOG:
+    
+    v2.0:
+      - Added 'debug' functions to simplify debug reporting to serial
+      - Added ability to change configuration during runtime. Send {??} via serial to enter config mode
+    
+    v1.0.2:
+      - Now we don't show a time/date on LCD if there is no matching alert displayed
+
+    v1.0.1:
+      - Changed delete flag from "!" to "#" to be more Linux script friendly
+      - Fix minor bug which caused some unexpected serial read errors
+      - Added additional option to output all configuration options to serial. A single "?" sent
+        will output contents of the alert array. Two "??" will output a previous, plus all config
+      - Fixed the way date/time is parsed
+      - Other minor changes
+        
+    KNOWN BUGS:
+    
+      - Can change baud rate during runtime just once. Subsequent changes causes number to be entered incorrectly (weird)
+    
+    FUTURE IMPROVEMENTS:
+    
+      - (hardware and software): Perhaps include a RTC module so that the time isn't erased every time the Arduino is reset
+    
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+    
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+    
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+    Credit to http://www.hacktronics.com/Tutorials/arduino-thermistor-tutorial for thermistor code.
+*/
+
+// START CONFIGURATION (do not edit anything above this line)
+//
+const int lcd_rows = 2, lcd_cols = 16; // Number of lines (rows) on the LCD screen (default: 2)
+                                       // Number of characters (columns) per line on the LCD screen (default: 16)
+unsigned int serial_baud = 115200; // Serial baud speed. Must match the baud set in Linux script file
+int delay_lcd_temp = 1; // Time delay between LCD refreshes with the current temp (seconds)
+int max_temp = 45; // Maximum temp before the fan is switched on (celsius)
+int fan_run_length = 320; // Length of time the fan will stay on once triggered (seconds)
+int min_temp = 35; // Temp at which the fan will stop spinning, even if fan_run_length time not reached (celsius)
+const int max_num_alerts = 5; // Maximum number of 'alerts' sent from Linux to hold and cycle through (max. 10)
+const int scr_char = 25; // Total number of chars that be used in an alert sent to Arduino from Linux via serial.
+                       // (eg. entire 16x2 screen has useable 32 chars). An extra char is added so the user
+                       // can tell which alert pairs with which timestamp (as they are displayed separately. So if you
+                       // have exactly 25 chars to spare for the alert, then variable should be set to 24 to avoid problems.
+int char_set = 0; // The animated character set can be changed. Currently only two to choose from. 0 or 1 (default: 0)
+int msg_display_len = 5; // Length of time to display each alert on LCD (seconds)
+int timestamp_display_len = 2; // Corresponding date/time for each alert is displayed after the alert (seconds)
+//
+// END CONFIGURATION (do not edit anything below this line)
+
+#include <Time.h>
+#include <LiquidCrystal.h>
+#include <math.h>
+
+// Digital Pins
+#define LCD_BACKLIGHT 2 // LCD backlight pin
+#define LCD_D7 3
+#define LCD_D6 4
+#define LCD_D5 5
+#define LCD_D4 6
+#define LCD_ENABLE 7
+#define LCD_RW 8
+#define LCD_RS 9
+// Pin 10 unused
+#define BUTTON 11 // Pushbutton
+#define RELAY 12 // Relay pin
+#define RESET 13 // Pin used to reset/restart the Arduino
+
+// Analog Pins
+#define THERMISTOR A0 // Analog pin for temp sensor
+
+LiquidCrystal lcd(LCD_RS, LCD_RW, LCD_ENABLE, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
+
+void setup() {
+  Serial.begin(serial_baud); // Serial sync speed. This needs to match in UDOO Linux for comms
+  pinMode(RESET, OUTPUT); // Reset pin
+  pinMode(RELAY, OUTPUT); // Relay switch for running 12V fan
+  pinMode(LCD_BACKLIGHT, OUTPUT); // LCD backlilght pin. This is statically set using resistor
+  pinMode(BUTTON, INPUT);
+  digitalWrite(RELAY, LOW); // Initial state is off
+  digitalWrite(LCD_BACKLIGHT, HIGH); // turn LCD backlight on
+  digitalWrite(BUTTON, HIGH); // Turns internal pull-up resistor on
+  lcd.begin(lcd_cols, lcd_rows); // Initialise LCD according to its size
+  lcd.clear();                   // start with a blank screen
+  delay(500);
+  debug("Starting UDOO Media System");
+  if (max_num_alerts > 10)
+    error("check serial", "Maximum number of alerts cannot exceed 10");
+  buildLCDChars(char_set); // Create custom chars for the LCD
+}
+
+void loop() {
+  if (millis() > 4294960000) // millis() (a 32bit number) wrap detection
+    delay(10000); // This will stop code from running for ~10 seconds to prevent
+                  // timer problems due to millis() wrap during a timer running
+                  // Yes, NOTHING will happen during this 10 seconds, but this should only
+                  // occur once every ~50 days (~4,294,967 seconds).
+                  // You can decrease the delay, but be sure to add to the 'if' statement
+                  // however many milliseconds you remove from the delay.
+                  // (eg. A delay of 5000 would mean you add the difference (5000) to 4294960000)
+  double temp = drawTemp(delay_lcd_temp);
+  checkButton();
+  checkTemp(temp, fan_run_length, max_temp, min_temp);
+  readSerial();
+  drawLCD(msg_display_len, timestamp_display_len);
+}
+
+//
+// FUNCTIONS:
+//
+
+void checkButton() {
+  // I dont know what I need the button for just yet, so for now it will reset the Arduino
+  int buttonState = digitalRead(BUTTON);
+  if (buttonState == LOW) { // button pressed
+    debug("BUTTON", "Button press detected");
+    digitalWrite(RELAY, !digitalRead(RELAY));
+    delay(1000);
+    digitalWrite(RESET, LOW);
+  }
+}
+
+boolean actionTrigger(unsigned long localTime, unsigned int triggerDelay) {
+/*
+  This function is designed to keep track of when to "do things"
+  and notify the calling function when it is time to trigger an
+  event. For example, if the temp sensor should be updated and
+  shown on LCD screen every 4 seconds, this functions will notify
+  when the 4 seconds is up.
+  This function accepts two parameters.
+  localTime - This is the time that we start counting from
+  triggerDelay - This is the length of time we count (in seconds)
+  When it is time to trigger an action, the function will return
+  TRUE, otherwise it will return FALSE.  
+*/
+  if ((millis() >  localTime) && ((millis() - localTime) > (triggerDelay * 1000)))
+    return true; // Check to ensure millis() hasn't wrapped;
+                 // and also if it is time to trigger an action
+  return false; // Otherwise, nothing changes
+}
+
+void error(String alert, String serialMsg) {
+  int i = 1;
+  while (i == 1) { // Infinite loop
+  lcd.clear();
+  lcd.setCursor(4,0);
+  lcd.print("[ERROR]");
+  lcd.setCursor(0,1);
+  lcd.print(alert);
+  debug("ERROR", serialMsg);
+  delay(1000);
+  }
+}
+
+// **************************************************************** 
+// ********************* LCD SCREEN FUNCTIONS ********************* 
+// **************************************************************** 
+
+void drawLCD(int timeDelay, int msgDelay) {
+  static unsigned long lcdTimer; // Used for the alert timing
+  static unsigned long lcdTimer2; // Used for the timestamp timing
+  static int index = 1; // Keep track of which alert is displayed on LCD
+  static boolean flip = false;
+  int currMsg = (index%4);
+  static unsigned long timestamp; // Used to hold the 32bit Unix epoch time
+
+  switch(flip) { // Used to flip between showing the alert and its corresponding timestamp
+    case true : {
+      if (lcdTimer == 0)
+        lcdTimer = millis();
+      if (!actionTrigger(lcdTimer, msgDelay)) // Run the code every <delay> seconds
+        return; // Exit function if it isnt time to run the code yet
+
+      clearLCD((scr_char+1)); // Before we draw anything, lets clear only the alert section of the screen    
+      debug("LCD", "Printing alert to screen");
+      String* toDraw = getAlertToPrint(); // Get the strings to draw
+      timestamp = convTimestamp(toDraw[0]); // Convert the timestamp from string to long
+      if (toDraw[1] == "") // If the string is empty this means there is nothing to print
+                           // so we need to make sure the timestamp is not printed too
+        timestamp = 1; // The 1 is a flag to say not to print any time at all
+      for (int i = 0; i < lcd_rows; i++) {
+        lcd.setCursor(0,i);
+        lcd.print(toDraw[i+1]); // +1 is because [0] holds the timestamp
+      }
+      lcdTimer = 0; // Reset the trigger counte
+      flip = (!flip); // Flip from 'alert' to 'timestamp' display
+      drawAnimation(index);
+      index++;      
+      break;
+    }
+    case false : {
+      if (lcdTimer2 == 0)
+        lcdTimer2 = millis();
+      if (!actionTrigger(lcdTimer2, timeDelay)) // Run the code every <delay> seconds
+        return; // Exit function if it isnt time to run the code yet
+
+      clearLCD((scr_char+1)); // Before we draw anything, lets clear only the alert section of the screen
+      debug("LCD", "Printing timestamp to screen");
+      lcd.setCursor(0,0);
+      // Would be better to use breakTime() for converting from epoch to real time, but I couldnt figure it out. So doing it longer way
+      if (timestamp != 1) { // We only set timestamp to 1 if there is no corresponding alert
+        lcdTime(day(timestamp)); lcd.print("/"); lcdTime(month(timestamp)); lcd.print(" | ");
+//      int yr = year(timestamp); lcdTime(yr - 1970); // Print only the last 2 digits of the year
+      lcdTime(hour(timestamp)); lcd.print(":"); lcdTime(minute(timestamp)); lcd.print(":"); lcdTime(second(timestamp));
+      }
+      lcdTimer2 = 0;
+      flip = (!flip); // Flip from 'alert' to 'timestamp' display
+      drawAnimation(index);
+      index++;
+      break;
+    }
+  }
+}
+
+unsigned long convTimestamp(String strStamp) {
+  // In order to convert the Unix epoch time we need to turn it in to a unsigned long first
+  char epoch[32];
+  strStamp.toCharArray(epoch, (strStamp.length()+1));
+  return (atoi(epoch));
+}
+
+void lcdTime(int num) { // Add leading zero to numbers 0 to 9 for showing time/date
+  if (num < 10)
+    lcd.print("0");
+  lcd.print(num);
+}
+
+void drawAnimation(int index) {
+  int myRow = ((scr_char)/lcd_cols); // Find the very last char we can use by finding last row
+  int myChar = ((scr_char)%lcd_cols); // and then last char on that row
+  index = index%8; // There are only 8 chars in the character set, so we loop through them
+  lcd.setCursor(myChar,myRow);
+  lcd.write(byte(index)); // Clear single char
+}
+
+void buildLCDChars(int char_set) {
+  // Creating the custom characters to display on the LCD.
+  // Initially I was going to use numbers but that looked ugly, so then I decided to use the good ol'
+  // spinning line (using /, -, |, and \) but the character set in the LCD turns the backslash in to
+  // a Japanese Yen symbole (apparently a common issue as many LCD's as manufactured with a different
+  // character set to what us in the Western world would use. This can't be changed).
+  // So ultimately I settled on creating my own character set. There is a maximum of 8 chars you can
+  // make, so I decided on 4 different sequences each with its matching inverse/negative character.
+  // The char will be used to display the alert while the inverse will be used to display the timestamp.
+  // This way the user will be able to match an alert to a timestamp; plus the added benefit of pretty
+  // graphics! It's a WIN/WIN!
+  
+  // Creating the new chars. Each byte represents a row of dots in the char. 0 = dot is off; 1 = dot is on.
+  byte custChar0[8], custChar1[8], custChar2[8], custChar3[8], custChar4[8], custChar5[8], custChar6[8], custChar7[8];
+  switch(char_set) {
+    default :
+      debug("WARN", "Invalid character set, using default of 0");
+    case 0 : {
+      custChar0 = {B01100, B01100, B00000, B00000, B00000, B00000, B00000, B00000};
+      custChar1 = {B10011, B10011, B11111, B11111, B11111, B11111, B11111, B11111};
+      custChar2 = {B01100, B01100, B00110, B00110, B00000, B00000, B00000, B00000};
+      custChar3 = {B10011, B10011, B11001, B11001, B11111, B11111, B11111, B11111};
+      custChar4 = {B01100, B01100, B00110, B00110, B01100, B01100, B00000, B00000};
+      custChar5 = {B10011, B10011, B11001, B11001, B10011, B10011, B11111, B11111};
+      custChar6 = {B01100, B01100, B00110, B00110, B01100, B01100, B00110, B00110};
+      custChar7 = {B10011, B10011, B11001, B11001, B10011, B10011, B11001, B11001};
+      break;
+    }
+    case 1 : {
+      custChar0 = {B10100, B11100, B00000, B00000, B00000, B00000, B00000, B00000};
+      custChar1 = {B01011, B00011, B11111, B11111, B11111, B11111, B11111, B11111};
+      custChar2 = {B10100, B11100, B00101, B00111, B00000, B00000, B00000, B00000};
+      custChar3 = {B01011, B00011, B11010, B11000, B11111, B11111, B11111, B11111};
+      custChar4 = {B10100, B11100, B00101, B00111, B10100, B11100, B00000, B00000};
+      custChar5 = {B01011, B00011, B11010, B11000, B01011, B00011, B11111, B11111};
+      custChar6 = {B10100, B11100, B00101, B00111, B10100, B11100, B00101, B00111};
+      custChar7 = {B01011, B00011, B11010, B11000, B01011, B00011, B11010, B11000};
+      break;
+    }
+  }
+  // Store all the new chars in an array
+  byte* allChars[8] = {custChar0, custChar1, custChar2, custChar3, custChar4, custChar5, custChar6, custChar7};
+
+  for (int i = 0; i < 8; i++) // Push the chars in to the LCD for later use using lcd.write(byte(x));
+    lcd.createChar(i, allChars[i]);
+}
+
+void clearLCD(int totalChars) {
+  // Clears the specified number of chars starting from top left of LCD and spanning rows
+  if (totalChars > (lcd_cols * lcd_rows)) // Make sure we don't clear more than the total num chars on LCD
+    totalChars = (lcd_cols * lcd_rows);
+  int rows = (totalChars/lcd_cols);
+  int charsInLastRow = (totalChars%lcd_cols);
+  for (int i = 0; i <  rows; i++) { // Clear the entire row
+    for (int j = 0; j < lcd_cols; j++) {
+      lcd.setCursor(j,i);
+      lcd.print(" "); // Clear single char
+    }
+  }
+  for (int i = 0; i < charsInLastRow; i++) { // Clear some chars in final row
+    lcd.setCursor(i,rows);
+    lcd.print(" ");
+  }
+}
+
+// ************************************************************************ 
+// ********************* THERMISTOR RELATED FUNCTIONS ********************* 
+// ************************************************************************ 
+
+double Thermister(int RawADC) {
+  double temp = log(((10240000/RawADC) - 10000));
+  // See http://en.wikipedia.org/wiki/Thermistor for explanation of formula
+  temp = 1 / (0.001129148 + (0.000234125 * temp) + (0.0000000876741 * temp * temp * temp));
+  temp = temp - 273.15;           // Convert Kelvin to Celcius
+  return temp;
+}
+
+int drawTemp(int delay) {
+  static unsigned long tempTimer;
+  static int index;
+  double temp = Thermister(analogRead(THERMISTOR));  // Read temp sensor
+  if (tempTimer == 0)
+    tempTimer = millis();
+  if (!actionTrigger(tempTimer, delay)) // Run the code every <delay> seconds
+    return temp; // Exit function if it isnt time to run the code yet
+
+  tempTimer = 0; // Reset the trigger counter
+  lcd.setCursor(10,1);
+  if (temp < 10)
+    lcd.print("0"); // Pad with a zero is less than 10
+  lcd.print(temp);
+  lcd.print("C");
+  if (index == 0) // We don't want to flood the serial with these msgs, so we stagger them
+    debug("TEMP", "Temperature is ", temp, "C");
+  index = (index+1)%10;
+  return temp;
+}
+
+void checkTemp(double temp, int fanTime, int maxTemp, int minTemp) {
+  static unsigned long fanTimer;
+  int delay = fanTime;
+  if ((temp < maxTemp) && (digitalRead(RELAY) == LOW))
+    return; // Nothing to see here, move along (exit function)
+  if ((digitalRead(RELAY) == HIGH) && (temp < min_temp)) { // Fan already running but below min_temp threshold
+    digitalWrite(RELAY, LOW); // Switch off fan regardless of fan timer state
+    debug("FAN", "Switched off due to temp dropping below ", minTemp, "C");
+    debug("FAN", "Timer reset");
+    fanTimer = 0;
+    return; // Exit function
+  }
+  if (fanTimer <= 0) {
+    fanTimer = millis();
+    debug("FAN", "Timer started. Fan will run for ", fanTime, " seconds, unless temp drops below ", minTemp, "C first");
+    digitalWrite(RELAY, HIGH); // Turn fan on    
+  }
+  if (actionTrigger(fanTimer, delay)) {
+    digitalWrite(RELAY, LOW); // Timer expired, turn fan off
+    debug("FAN", "Switched off due to timer expiring");
+    debug("FAN", "Timer reset");
+    fanTimer = 0;
+  } else if (millis() < fanTimer) { // millis() wrap detection
+    digitalWrite(RELAY, LOW); // This is needed as the wrap detection in loop() is
+                              // too short to help us here.
+    debug("FAN", "Switched off due to millis() wrap error prevention");
+    debug("FAN", "Timer reset");
+    fanTimer = 0;
+  }
+}
+
+// ****************************************************************** 
+// ********************* SERIAL COMMS FUNCTIONS ********************* 
+// ****************************************************************** 
+
+// Once we put this code in to its own library we can place the below global variables inside the Constructor
+// I am keeping these global variables here so that all serial comms related code is in one place
+char arrAlerts[max_num_alerts][scr_char+1] = {"UDOO MediaSystem"}; // 2D array to store rotating alerts sent to us by Linux through serial
+time_t arrTimestamp[max_num_alerts]; // Corresponding array to hold timestamps for alerts
+int currIndex = 0; // Used to keep track of which index to use in the array
+String currAlert[(lcd_rows+1)]; // First element is always timestamp, then followed by an element for each LCD row
+                                // This variable is used only for returning data to be displayed on LCD screen
+
+void readSerial() {
+/*
+  Our serial protocol is simple. All strings to be parsed must begin with { and end with }
+  and contain no more than scr_char characters
+  All received strings should coming inbound already sanitised by way of whatever script we
+  are using in Linux. However, this program does some of its own sanitising too.
+  All received strings are placed inside an array which is FIFO rotated. Number of slots in
+  the array is determined by max_num_alerts configuration option.
+  
+  A # followed immediately after the { is the "delete flag". This means that the string
+  should be marked for deletion if an exact match is found in the array.
+  
+  If a duplicate alert is received then the old alert is deleted and the new alert is
+  added at the head of the array, thereby extending its life in the FIFO rotation.
+  [NOTE: FIFO is not working. Currently no re-ordering is done]
+  
+  All alerts stored in the array also have a timestamp added by the Arduino code.
+  An @ followed immediately after the { is the "time stamp" flag. This means a time stamp is
+  to be found afterwards in the format DD,MM,YYYY,hh,mm,ss and ending with the }
+
+  Sending ?? enters configuration mode. Minimal error-checking is done here (since v1.0.3) so
+  be sure to configure properly otherwise you end up in an exception.
+*/
+  if (Serial.find("{")) { // Our protocol requires strings to be printed on LCD to begin with {
+    char serialData[(scr_char+1)]; // Num of chars to display on screen. The +1 is to hold the NULL terminator
+    int typeFlag = 0; // Type 0. Add alert (default)
+    int numChars = Serial.readBytesUntil('}', serialData, (scr_char+1)); // Store chars until } is found
+    serialData[numChars] = NULL; // Add the NULL terminator
+    debug("SERIAL", "Serial comms detected");
+    switch(serialData[0]) { // Looking for ASCII decimal values
+      case 35: // Looking for "#". ASCII 33 == #
+        typeFlag = 1; // Type 1. Delete alert
+        for (int i = 0; i < numChars; i++) // Shift all chars one slot left, to remove the flag
+          serialData[i] = serialData[i+1];
+        serialData[scr_char] = NULL; // Terminate with NULL
+        break;
+      case 64: // Looking for "@". ASCII 64 == @
+        // No error checking done. Be sure the correct time/date format is sent!
+//        timeDateSet(Serial.parseInt(), Serial.parseInt(), Serial.parseInt(), Serial.parseInt(), Serial.parseInt(), Serial.parseInt());
+        for (int i = 0; i < numChars; i++) // Shift all chars one slot left, to remove the flag
+          serialData[i] = serialData[i+1];
+        serialData[scr_char] = NULL; // Terminate with NULL
+        timeDateSet(serialData);
+        debug("SERIAL", "Timestamp flag detected");
+        return; // Exit function. Time is already set and nothing else left to do
+        break; // We shouln't hit this code, but here for completeness
+      case 63: // Looking for "?". ASCII 63 == ?
+        typeFlag = 2; // Type 2. Data dump
+        for (int i = 0; i < numChars; i++) // Shift all chars one slot left, to remove the flag
+//        serialData[i] = serialData[i+1];
+//        serialData[scr_char] = NULL; // Terminate with NULL
+        if (serialData[1] == 63) // If we see a second ? after the first, then we dump all information including config
+          typeFlag = 3; // Type 3. Verbose data dump (includes configuration)
+        break;
+    }
+
+    serialData[scr_char] = NULL; // Add a NULL char at the end of the string
+    Serial.print("[SERIAL] - "); Serial.print(numChars); Serial.print(" chars captured. Parsed as: ");
+    for (int i = 0; i < numChars; i++)
+      Serial.print(serialData[i]);
+    Serial.print("\n");
+    switch(typeFlag) {
+      case 1: // All alerts need to be processed first
+        debug("SERIAL", "Delete flag detected");
+      case 0 :
+        findAlert(numChars, typeFlag, serialData);
+        break;
+      case 2 :
+        dataDump(0); // Dump contents of array to serial
+        break;
+      case 3 :
+        dataDump(1); // Verbose data dump & configuration mode
+        break;
+    }
+  }
+}
+
+void timeDateSet(char serialData[]) {
+/*
+  Time is periodically _pushed_ to the Arduino from Linux. Arduino will never pull the
+  time. So this means you need to make sure that Linux is configured to send the time
+  to Arduino, otherwise you will have timestamps that begin from Unix epoch.
+  
+  Data we receive should be in the format DD,MM,YYYY,hh,mm,ss
+  We expect the date/time to be in the correct format. No sanity checking is
+  done here.
+  
+  NOTE: All timer-based time keeping uses millis() and not this clock. Therefore,
+  the time being set correctly is _optional_. This time is used to timestamp
+  alerts that are received through from Linux for displaying on screen.
+*/ 
+// A convoluted and ugly way of parsing the string. I will fix this later
+  String data = String(serialData);
+  int commaIndex = data.indexOf(','); // Comma delimited
+  int secondIndex = data.indexOf(',', commaIndex+1);
+  int thirdIndex = data.indexOf(',', secondIndex+1);
+  int fourthIndex = data.indexOf(',', thirdIndex+1);
+  int fifthIndex = data.indexOf(',', fourthIndex+1);
+  int sixthIndex = data.indexOf(',', fifthIndex+1);
+
+  int sday = (data.substring(0, commaIndex)).toInt();
+  int smonth = (data.substring(commaIndex+1, secondIndex)).toInt();
+  int syear = (data.substring(secondIndex+1, thirdIndex)).toInt();
+  int shour = (data.substring(thirdIndex+1, fourthIndex)).toInt();
+  int sminute = (data.substring(fourthIndex+1, fifthIndex)).toInt();
+  int ssecond = (data.substring(fifthIndex+1, sixthIndex)).toInt();
+
+  setTime(shour, sminute, ssecond, sday, smonth, syear);
+  Serial.print("[SERIAL] - Time/Date set: "); printTime(hour()); Serial.print(":"); printTime(minute()); Serial.print(":"); printTime(second());
+  Serial.print(" - "); printTime(day()); Serial.print("/"); printTime(month()); Serial.print("/"); printTime(year()); Serial.println();
+}
+
+void dataDump(int type) {
+  Serial.print("Dumping entire contents of alerts array to serial\n");
+  Serial.print("--------------------\n");
+  for (int i=0; i < max_num_alerts; i++) {
+    // Would be better to use breakTime() for converting from epoch to real time, but I couldnt figure it out. So doing it longer way
+    Serial.print("Index ["); Serial.print(i); Serial.print("] {"); printTime(day(arrTimestamp[i])); Serial.print("/");
+    printTime(month(arrTimestamp[i])); Serial.print("/"); printTime(year(arrTimestamp[i])); Serial.print(" - "); printTime(hour(arrTimestamp[i]));
+    Serial.print(":"); printTime(minute(arrTimestamp[i])); Serial.print(":"); printTime(second(arrTimestamp[i])); Serial.print("} - ");
+    for (int j = 0; j < (scr_char+1); j++)
+      Serial.print(arrAlerts[i][j]);
+    Serial.print("\n");
+  }
+  Serial.print("Next write to index "); Serial.print(currIndex%max_num_alerts); Serial.print(" next\n");
+  if (type != 1)
+    return; // Exit function
+
+  // Configuration Mode. Initial settings can be viewed and changed here.
+  // This section should only run if {??} was sent through the serial.
+  Serial.print("------\n");
+  Serial.print("Configuration:\n");
+  Serial.print("(a) LCD screen rows: "); Serial.print(lcd_rows); Serial.print("\n");
+  Serial.print("(b) LCD screen columns: "); Serial.print(lcd_cols); Serial.print("\n");
+  Serial.print("(c) Serial baud rate: "); Serial.print(serial_baud); Serial.print("\n");
+  Serial.print("(d) Frequency of temperature update on LCD (seconds): "); Serial.print(delay_lcd_temp); Serial.print("\n");
+  Serial.print("(e) Upper temperature that fan switches on (celsius): "); Serial.print(max_temp); Serial.print("\n");
+  Serial.print("(f) Length of time fan will run for (seconds): "); Serial.print(fan_run_length); Serial.print("\n");
+  Serial.print("(g) Lower temperature that switches off (celsius): "); Serial.print(min_temp); Serial.print("\n");
+  Serial.print("(h) Maximum number of alerts to store and rotate: "); Serial.print(max_num_alerts); Serial.print("\n");
+  Serial.print("(i) Maximum number of characters per alert: "); Serial.print(scr_char); Serial.print("\n");
+  Serial.print("(j) LCD animation character set to use: "); Serial.print(char_set); Serial.print("\n");
+  Serial.print("(k) Alert display length (seconds): "); Serial.print(msg_display_len); Serial.print("\n");
+  Serial.print("(l) Date/Time display length (seconds): "); Serial.print(timestamp_display_len); Serial.print("\n");
+  Serial.print("--------------------\n");
+  Serial.print("CONFIGURATION MODE (Arduino is paused until you leave this mode)\n");
+  Serial.print("Select the letter of the item to configure or X to exit:\n");
+
+  while (Serial.available() >= 1)
+    Serial.read(); // Clear out serial buffer (sometime there may be spurious bytes waiting there to be read)
+  while(1) { // Infinite loop. Nothing happens in entire program until we send data through serial
+    if (Serial.available() >= 1) {
+      unsigned int num; // Temporary placeholder for received data
+      int min; // Minimum threshold for configured option
+      int max; // Maximum threshold for configured option
+      switch(Serial.peek()) {
+        case 97: // Looking for "a". ASCII 97 == a
+          debug("Cannot change this option during runtime.\nPlease change in source and recompile.");
+          //Serial.print("(a) LCD screen rows ("); Serial.print(lcd_rows); Serial.print("): \n");
+          //num = configChange();
+          //Serial.println(num);
+          break;
+        case 98: // ASCII b
+          debug("Cannot change this option during runtime.\nPlease change in source and recompile.");
+          //configChange();
+          //Serial.print("(b) LCD screen columns ("); Serial.print(lcd_cols); Serial.print("): ");
+          //break;
+        case 99: // ASCII c
+          Serial.print("(c) Serial baud rate ("); Serial.print(serial_baud); Serial.print("): ");
+          serial_baud = configChange();
+          Serial.print("Changing serial speed to "); Serial.print(serial_baud); Serial.print("\n");
+          delay(1000); // Pause for effect
+          Serial.begin(serial_baud);
+          break;
+        case 100: // ASCII d
+          Serial.print("(d) Frequency of temperature update on LCD ("); Serial.print(delay_lcd_temp); Serial.print("): ");
+          num = configChange();
+          min = 1;
+          max = 300;
+          if (num >= min && num <= max) {
+            delay_lcd_temp = num;
+            break;
+          }
+          Serial.print("Config unchanged. Number must be between "); Serial.print(min); Serial.print(" and "); Serial.print(max); Serial.print("\n");
+          break;
+        case 101: // ASCII e
+          Serial.print("(e) Upper temperature that fan switches on ("); Serial.print(max_temp); Serial.print("): ");
+          num = configChange();
+          min = 41;
+          max = 70;
+          if (num >= min && num <= max) {
+            max_temp = num;
+            break;
+          }
+          Serial.print("Config unchanged. Number must be between "); Serial.print(min); Serial.print(" and "); Serial.print(max); Serial.print("\n");
+          break;
+        case 102: // ASCII f
+          Serial.print("(f) Length of time fan will run for ("); Serial.print(fan_run_length); Serial.print("): ");
+          num = configChange();
+          min = 30;
+          max = 600;
+          if (num >= min && num <= max) {
+            fan_run_length = num;
+            break;
+          }
+          Serial.print("Config unchanged. Number must be between "); Serial.print(min); Serial.print(" and "); Serial.print(max); Serial.print("\n");
+          break;
+        case 103: // ASCII g
+          Serial.print("(g) Lower temperature that switches off ("); Serial.print(min_temp); Serial.print("): ");
+          num = configChange();
+          min = 20;
+          max = 40;
+          if (num >= min && num <= max) {
+            min_temp = num;
+            break;
+          }
+          Serial.print("Config unchanged. Number must be between "); Serial.print(min); Serial.print(" and "); Serial.print(max); Serial.print("\n");
+          break;
+        case 104: // ASCII h
+          debug("Cannot change this option during runtime.\nPlease change in source and recompile.");
+          // configChange();
+          // Serial.print("(h) Maximum number of alerts to store and rotate ("); Serial.print(max_num_alerts); Serial.print("): ");
+          break;
+        case 105: // ASCII i
+          debug("Cannot change this option during runtime.\nPlease change in source and recompile.");
+          // configChange();
+          // Serial.print("(i) Maximum number of characters per alert ("); Serial.print(scr_char); Serial.print("): ");
+          break;
+        case 106: // ASCII j
+          Serial.print("(j) LCD animation character set to use ("); Serial.print(char_set); Serial.print("): ");
+          num = configChange();
+          min = 0;
+          max = 10;
+          if (num >= min && num <= max) {
+            char_set = num;
+            buildLCDChars(char_set);
+            break;
+          }
+          Serial.print("Config unchanged. Number must be between "); Serial.print(min); Serial.print(" and "); Serial.print(max); Serial.print("\n");
+          break;
+        case 107: // ASCII k
+          Serial.print("(k) Alert display length ("); Serial.print(msg_display_len); Serial.print("): ");
+          num = configChange();
+          min = 1;
+          max = 30;
+          if (num >= min && num <= max) {
+            msg_display_len = num;
+            break;
+          }
+          Serial.print("Config unchanged. Number must be between "); Serial.print(min); Serial.print(" and "); Serial.print(max); Serial.print("\n");
+          break;
+        case 108: // ASCII l
+          Serial.print("(l) Date/Time display length ("); Serial.print(timestamp_display_len); Serial.print("): ");
+          num = configChange();
+          min = 1;
+          max = 30;
+          if (num >= min && num <= max) {
+            timestamp_display_len = num;
+            break;
+          }
+          Serial.print("Config unchanged. Number must be between "); Serial.print(min); Serial.print(" and "); Serial.print(max); Serial.print("\n");
+          break;
+      }
+    break; // break out of infinite loop (exit config mode)
+    }
+  }
+  Serial.print("--------------------\n");
+}
+
+int configChange() {
+  // This function will grab the input from serial as byte stream and parse is back as
+  // an integer.
+  Serial.print("<Enter new value>\n");
+  while (Serial.available() >= 1)
+    Serial.read(); // Clear out serial buffer
+  while(1) { // Another infinite loop to wait for serial input
+    if (Serial.available() >=1) {
+      delay(2); // We wait a while to make sure all serial data is available
+      int chars = Serial.available(); // Number of bytes received via serial
+      int myNum = 0;
+      int multiplier = 1;
+      for (int i = 1; i <= chars; i++) {
+        delay(2); // Pause for dramatic effect. Seriously though, on faster baud arduino is too fast line rate
+        char rawNum[1] = {(char)Serial.read()}; // No error checking here, so be sure to enter an int
+        int num = atoi (rawNum); // atoi is needed to convert the byte represented as ASCII to an integer
+        // atoi takes only an array of chars, hence why the Serial.read() is read in to an array of 1
+        // I found atoi only after writing the below code. Looking at atoi I am sure we could just read
+        // the entire contents of the serial buffer in to the array of chars and then atoi the whole thing
+        // to a full integer. So the use of the below multiplier etc is redundant. I'll try it another time.
+        // For now, this works.
+        if ((chars - i) >= 1) { // Calculating increase of base10 decimal place
+          for (int y = 0; y < (chars - i); y++) // Multiplier is number of base10 places to multiply to
+            multiplier = multiplier * 10;
+        }
+        // If a non-integer value is received, atoi will use a zero.
+        myNum = myNum + (num * multiplier); // Rolling number addition
+        multiplier = 1; // Reset for next iteration
+      }
+      return myNum;
+    }
+  }
+}
+
+String* getAlertToPrint() {
+/*
+  This functions will sanitise and return the text to be printed to the LCD
+  The text is placed inside an array of Strings where each array element
+  contains texts for one row on the LCD.
+  The first array element is always the Unix epoch timestamp which corresponds
+  to the alert.
+  This function will rotate and keep track of which alert to be presented.
+*/
+  static int counter = 0; // This is used to keep track of which alert+timestamp to fetch and sanitise
+  for (int i = 0; i < (lcd_rows+1); i++) // First we clear out previous data from the array
+    currAlert[i] = "";
+  currAlert[0] = String(arrTimestamp[counter]); // Timestamp always goes in first element slot
+  String tmpGlob = String(arrAlerts[counter]); // Placing the alert in temp string for processing
+  int globLength = tmpGlob.length();
+  if (globLength > (lcd_rows * lcd_cols)) // Number of chars in the alert should never more than the number 
+    error("too many chars", "Alerts cannot exceed total number of chars on the LCD");
+  int rowsNeeded = globLength / lcd_cols; // Calculating numbers of rows needed to display the alert
+  if ((globLength%lcd_cols) > 0) // If we get a modulo result that is not 0, this means there are more chars
+    rowsNeeded++; // So we add another row
+  for (int i = 0; i < rowsNeeded; i++) {
+    int startPosition = (lcd_cols * i);
+    int endPosition = ((lcd_cols * i) + lcd_cols);
+    if (endPosition > globLength)
+      endPosition = globLength; // Make sure we stay within the bounds of the string
+    currAlert[i+1] = tmpGlob.substring(startPosition, endPosition);
+  }
+  counter = (counter+1)%max_num_alerts;
+  int looper = 0; // Used for below 'while' loop only, to make sure we dont get stuck in infinite loop 
+    while (arrAlerts[counter][0] == NULL) {
+    counter = (counter+1)%max_num_alerts; // Finding the next non-empty element to use
+    if (looper > max_num_alerts)
+      return currAlert; // No more elements with data found, exit to avoid inifite loop
+    looper++;
+  } 
+  return currAlert; 
+}
+
+void findAlert(int numChars, int type, char serialData[]) {
+  String receivedData(serialData); // Convert to String for easier comparison
+  for (int i=0; i < max_num_alerts; i++) {
+    if (arrAlerts[i][0] != NULL) { // Only run below code if an element exists in the array
+      char tempArr[(scr_char+1)];
+      for (int j = 0; j < (scr_char+1); j++)
+        tempArr[j] = arrAlerts[i][j]; // Building the entire string to tempArr for comparison
+      String existingData(tempArr);
+      if (existingData.equals(receivedData)) { // Comparing strings, if match found then we delete the array entry
+        debug("DEBUG", "Duplicate alert found in array, deleting index ", i);
+        deleteAlert(i);
+      }
+    }
+  }
+  switch(type) {
+    case 0: // If flag is set to 0, then we add the entry to the array
+      addAlert(numChars, serialData);
+      break;
+  }
+}
+
+int addAlert(int numChars, char serialData[]) {
+  deleteAlert(currIndex%max_num_alerts); // We need to make sure the array element is empty before we use it
+  for (int i = 0; i < numChars; i++) { // Adding data from serial to array
+    arrAlerts[currIndex%max_num_alerts][i] = serialData[i];
+    arrAlerts[currIndex%max_num_alerts][i+1] = NULL; // Add a NULL to the end of the chars
+  }
+  arrTimestamp[currIndex%max_num_alerts] = now(); // Grab current date/time in epoch format. Stored in corresponding array
+  debug("DEBUG", "Adding alert to array at index ", currIndex%max_num_alerts, " with epoch timestamp: ", arrTimestamp[currIndex%max_num_alerts]);
+  currIndex++; // Increment index in preparation for next incoming alert
+}
+
+void deleteAlert(int index) {
+  for (int i = 0; i < (scr_char+1); i++) // Delete alert array
+    arrAlerts[index][i] = NULL;
+  arrTimestamp[index] = NULL; // Delete corresponding timestamp for that alert
+}
+
+void printTime(int num) { // Add leading zero to numbers 0 to 9 for showing time/date
+  if (num < 10)
+    Serial.print("0");
+  Serial.print(num);
+}
+
+
+// ************************************************* 
+// ********************* DEBUG ********************* 
+// ************************************************* 
+
+void debug(String type, String message) {
+  Serial.print("[");
+  Serial.print(type);
+  Serial.print("] - ");
+  Serial.print(message);
+  Serial.print("\n");
+}
+
+void debug(String type, String message, int number) {
+  Serial.print("[");
+  Serial.print(type);
+  Serial.print("] - ");
+  Serial.print(message);
+  Serial.print(number);
+  Serial.print("\n");
+}
+
+void debug(String type, String message, int number, String message2) {
+  Serial.print("[");
+  Serial.print(type);
+  Serial.print("] - ");
+  Serial.print(message);
+  Serial.print(number);
+  Serial.print(message2);
+  Serial.print("\n");
+}
+
+void debug(String type, String message, int number, time_t time) {
+  Serial.print("[");
+  Serial.print(type);
+  Serial.print("] - ");
+  Serial.print(message);
+  Serial.print(number);
+  Serial.print(time);
+  Serial.print("\n");
+}
+
+void debug(String type, String message, int number, String message2, int number2, String message3) {
+  Serial.print("[");
+  Serial.print(type);
+  Serial.print("] - ");
+  Serial.print(message);
+  Serial.print(number);
+  Serial.print(message2);
+  Serial.print(number2);
+  Serial.print(message3);
+  Serial.print("\n");
+}
+
+void debug(String type, String message, int number, String message2, int number2) {
+  Serial.print("[");
+  Serial.print(type);
+  Serial.print("] - ");
+  Serial.print(message);
+  Serial.print(number);
+  Serial.print(message2);
+  Serial.print(number2);
+  Serial.print("\n");
+}
+
+void debug(String message, int number) {
+  Serial.print(message);
+  Serial.print(number);
+  Serial.print("\n");
+}
+
+void debug(String type, int number, String message) {
+  Serial.print("[");
+  Serial.print(type);
+  Serial.print("] - ");
+  Serial.print(number);
+  Serial.print(message);
+  Serial.print("\n");
+}
+
+void debug(String type, int number, String message, boolean newLine) {
+  Serial.print("[");
+  Serial.print(type);
+  Serial.print("] - ");
+  Serial.print(number);
+  Serial.print(message);
+//  Serial.print("\n");
+}
+
+void debug(String message) {
+  Serial.print(message);
+  Serial.print("\n");
+}
+
+void debug(String type, int number, String message, char number2) {
+  Serial.print("[");
+  Serial.print(type);
+  Serial.print("] - ");
+  Serial.print(number);
+  Serial.print(message);
+  Serial.print(number2);
+  Serial.print("\n");
+}
