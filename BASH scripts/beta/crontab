@@ -1,0 +1,26 @@
+# https://github.com/JaykGit/UDOOMediaSystem
+# www.makeitbreakitfixit.com April/2014
+#
+# Add this to your crontab (ie. crontab -e)
+
+
+# Every 10 minutes updates Arduino on UDOO with the current date/time
+*/10 * * * * /root/bin/UDOO-send_date.sh | logger
+
+# Every 1 minute we check to ensure the process is running. If the state changes
+# we let the Arduino know about it. See the actual script for more usage info.
+*/1 * * * * /root/bin/UDOO-check_services.sh /var/run/minidlna/minidlna.pid MiniDLNA
+*/1 * * * * /root/bin/UDOO-check_services.sh /var/run/transmission/transmission.pid Transmission
+*/1 * * * * /root/bin/UDOO-check_services.sh /var/run/couchpotato/couchpotato.pid CouchPotato
+*/1 * * * * /root/bin/UDOO-check_services.sh /var/run/openvpn.clientLA_VPS_UDP55.pid USA_VPS
+*/1 * * * * /root/bin/UDOO-check_services.sh /var/run/openvpn.serverUDP443.pid VorigVPN
+*/1 * * * * /root/bin/UDOO-check_services.sh /var/run/squid3.pid Squid
+
+# 1) /root/bin/UDOO-check_services.sh is the location of where your script is.
+# Be sure all scripts are executable (chmod +x scriptfiles.sh)
+
+# 2) /var/run/file.pid is the location of the process PID file. Not all are stored in /var/run,
+# so you may need to do some searching. Some processes wont create a PID unless you explicity ask it to.
+
+# 3) The final arument in each line is just the name of the program as you would like to see it
+# on the LCD screen attached to the Arduino.
