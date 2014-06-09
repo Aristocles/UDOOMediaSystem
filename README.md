@@ -1,7 +1,7 @@
 UDOOMediaSystem
 ===============
 
-This is an Arduino project built using the Arduino Due built in to a UDOO (www.udoo.org). For a detailed list of instructions, see the tutorial here: http://makeitbreakitfixit.com/2014/02/28/diy-complete-media-system-that-fits-in-the-palm-of-your-hand/ for tutorial
+This is an Arduino project built using the Arduino Due built in to a UDOO (www.udoo.org). For a detailed list of instructions, see the tutorial here: http://makeitbreakitfixit.com/2014/02/28/diy-complete-media-system-that-fits-in-the-palm-of-your-hand/
 
 PROJECT IN A NUTSHELL:
 
